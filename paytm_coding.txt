@@ -1,0 +1,250 @@
+1. Sessionize the web log by IP. Sessionize = aggregrate all page hits by visitor/IP during a session. https://en.wikipedia.org/wiki/Session_(web_analytics)
+
+%pyspark
+
+# Use pandas to load and create dataframe, validation checks and convert to DF for Spark SQL
+
+import pandas as pd
+
+# Add log file to the notebook folder and update below
+my_notebook_path = "notebook/2BRW2UY1G"
+
+# Set column names
+col_names = ["timestamp", "elb", "client:port", "backend:port", "request_processing_time", "backend_processing_time",
+                "response_processing_time", "elb_status_code", "backend_status_code", "received_bytes", "sent_bytes", 
+                "request", "user_agent", "ssl_cipher", "ssl_protocol"]
+
+# Import data
+# Error loading data without column names, 23 records need to be skipped and get their warnings as output (error_bad_lines=False) 
+df = pd.read_csv(my_notebook_path + "/2015_07_22_mktplace_shop_web_log_sample.log", 
+                    delim_whitespace=True, names=col_names)
+                    
+print df.count();
+
+timestamp                   1158500
+elb                         1158500
+client:port                 1158500
+backend:port                1158500
+request_processing_time     1158500
+backend_processing_time     1158500
+response_processing_time    1158500
+elb_status_code             1158500
+backend_status_code         1158500
+received_bytes              1158500
+sent_bytes                  1158500
+request                     1158500
+user_agent                  1158495
+ssl_cipher                  1158500
+ssl_protocol                1158500
+dtype: int64
+
+%pyspark 
+
+# Create df of features needed for analysis
+df_sessions = df.loc[:,[ "client:port", "request", "timestamp"]]
+
+# Strip out port from client:port to create "unique user" 
+df_sessions["client_ip"] = df_sessions["client:port"].str.split(":").str[0]
+df_sessions.drop("client:port", axis=1, inplace=True)
+
+# Sort data (required later)
+df_sessions = df_sessions.sort_values(by="timestamp")
+
+print df_sessions.shape
+
+(1158500, 3)
+
+%pyspark 
+
+# Convert to Spark dataFrame and create a table for SQL queries
+sparkDfSessions = sqlContext.createDataFrame(df_sessions)
+sparkDfSessions.registerTempTable("weblogSessions")
+
+%sql
+
+-- Check to make sure things look okay
+--  DESC weblogSessions
+SELECT * FROM weblogSessions LIMIT 1
+
+request																										timestamp					client_ip
+GET https://paytm.com:443/shop/wallet/txnhistory?page_size=10&page_number=0&channel=web&version=2 HTTP/1.1	2015-07-22T02:40:06.499174Z	106.51.235.133
+
+
+1. Sessionize the web log by IP. Sessionize = aggregrate all page hits by visitor/IP during a session. https://en.wikipedia.org/wiki/Session_(web_analytics)
+
+%sql 
+
+-- DROP TABLE weblogSessions_timestamps
+CREATE TEMPORARY TABLE IF NOT EXISTS weblogSessions_timestamps(client_ip STRING, request STRING, timestamp TIMESTAMP, previous_timestamp TIMESTAMP)
+
+%sql 
+
+-- Add new column to track previous entry time
+-- Find difference between current and last entry time for same user
+-- Find running total/cumulative sum and break up entry times by defined threshold for a session (restart running total)
+
+-- Create new column with previous_timestamp entry (row shifted down) "grouped" by client_ip
+-- Naming columns just to reorder for better visual reference
+INSERT INTO TABLE weblogSessions_timestamps
+    SELECT client_ip, request, timestamp,
+        LAG(timestamp) OVER (PARTITION BY client_ip ORDER BY timestamp) AS previous_timestamp
+      FROM weblogSessions
+	  
+%sql 
+
+-- Check to make sure things look okay
+select * from weblogSessions_timestamps limit 20
+
+%sql 
+
+-- DROP TABLE weblogSessions_sessions
+CREATE TEMPORARY TABLE IF NOT EXISTS weblogSessions_sessions(client_ip STRING, request STRING, timestamp TIMESTAMP, previous_timestamp TIMESTAMP, is_new_session INT)
+
+%sql 
+
+-- Create / determine sessions 
+-- Calculate running total (current - previous timestamps) within client_ip "groups" and break up via session threshold
+INSERT INTO TABLE weblogSessions_sessions
+    SELECT *,
+        CASE WHEN unix_timestamp(timestamp) - unix_timestamp(previous_timestamp) >= (60 * 15) -- using 15mins as session interval
+             OR previous_timestamp IS NULL
+        THEN 1 ELSE 0 END AS is_new_session
+    FROM weblogSessions_timestamps
+
+%sql 
+
+-- DROP TABLE weblogSessions_sessionIds
+CREATE TEMPORARY TABLE IF NOT EXISTS weblogSessions_sessionIds(client_ip STRING, request STRING, timestamp TIMESTAMP, previous_timestamp TIMESTAMP, is_new_session INT, session_id INT)
+
+%sql 
+
+-- Create id per sessions (running total of is_new_session)
+INSERT INTO TABLE weblogSessions_sessionIds
+    SELECT *, SUM(is_new_session) OVER (PARTITION BY client_ip ORDER BY timestamp) AS session_id
+    FROM weblogSessions_sessions
+
+%sql 
+
+-- Clean up temp tables
+-- DROP TABLE weblogSessions
+-- DROP TABLE weblogSessions_timestamps
+-- DROP TABLE weblogSessions_sessions
+-- DROP TABLE weblogSessions_sessionIds
+
+2. Determine the average session time
+
+%sql 
+
+-- Determine the average session time
+SELECT 
+    SUM(total_session_time_per_ip) AS amount_of_time, 
+    SUM(num_of_sessions_per_ip) AS num_of_sessions,
+    (SUM(total_session_time_per_ip) / SUM(num_of_sessions_per_ip)) / 60 AS average_session_time_in_mins
+FROM (
+    SELECT client_ip, MAX(session_id) AS num_of_sessions_per_ip, SUM(session_time) AS total_session_time_per_ip
+    FROM (
+        SELECT client_ip, session_id, MAX(unix_timestamp(timestamp)) - MIN(unix_timestamp(timestamp)) AS session_time
+        FROM weblogSessions_sessionIds
+        GROUP BY client_ip, session_id 
+        ORDER BY client_ip, session_id
+    ) grouped_sessions
+    GROUP BY client_ip
+) average_sessions
+
+amount_of_time       num_of_sessions       average_session_time_in_mins	 
+11161579	         110841	               1.6783168382337463
+
+3. Determine unique URL visits per session.
+To clarify, count a hit to a unique URL only once per session.
+
+%sql 
+
+-- Determine unique URL visits per session. To clarify, count a hit to a unique URL only once per session.
+-- What is a URL visit (below are not 'visits')
+-- https://paytm.com:443/styles/app.css HTTP/1.1
+-- https://paytm.com:443/favicon.ico HTTP/1.1
+-- A Visit
+-- https://paytm.com:443/shop/wallet/balance?channel=web&version=2 HTTP/1.1
+
+SELECT SUM(total_unique_visits) / SUM(total_sessions_per_ip) AS average_unique_visits_per_session
+FROM (
+    SELECT
+        client_ip, MAX(session_id) AS total_sessions_per_ip, COUNT(request) AS total_unique_visits,
+        COUNT(request) / MAX(session_id) AS unique_visits_per_session
+    FROM (
+        SELECT DISTINCT client_ip, session_id, request
+        FROM weblogSessions_sessionIds  
+        WHERE 
+        substring(request,-13, 13) NOT RLIKE '\\.[a-z]{2,3}' -- need to fix this part including .js?stuff HTTP/1.1
+    ) sessions
+    GROUP BY client_ip
+) visits
+
+4. Find the most engaged users, ie the IPs with the longest session times
+
+%sql 
+
+-- Find the most engaged users, ie the IPs with the longest session times
+SELECT client_ip, session_id, (MAX(unix_timestamp(timestamp)) - MIN(unix_timestamp(timestamp))) / 60 AS session_time_in_mins
+FROM weblogSessions_sessionIds
+GROUP BY client_ip, session_id
+ORDER BY session_time_in_mins DESC
+LIMIT 50 -- 'engaged' users will be the top 50
+
+
+client_ip	session_id	session_time_in_mins
+106.186.23.95	5	34.48333333
+119.81.61.166	5	34.48333333
+52.74.219.71	5	34.48333333
+125.20.39.66	4	34.46666667
+125.19.44.66	5	34.46666667
+54.251.151.39	5	34.45
+180.211.69.209	4	34.45
+192.8.190.10	3	34.45
+122.15.156.64	3	34.43333333
+203.189.176.14	5	34.43333333
+203.191.34.178	2	34.43333333
+180.179.213.70	5	34.43333333
+103.29.159.138	1	34.41666667
+213.239.204.204	2	34.41666667
+125.16.218.194	1	34.41666667
+180.151.80.140	4	34.41666667
+103.29.159.186	2	34.4
+78.46.60.71	1	34.4
+14.99.226.79	1	34.38333333
+192.71.175.30	3	34.38333333
+135.245.115.245	1	34.38333333
+103.29.159.213	2	34.38333333
+54.240.199.105	5	34.36666667
+163.53.211.6	2	34.35
+125.22.193.150	3	34.35
+54.169.191.85	3	34.35
+125.17.164.241	5	34.35
+122.169.141.4	1	34.33333333
+91.103.41.1	4	34.33333333
+125.21.240.2	4	34.33333333
+66.102.6.254	1	34.33333333
+103.29.159.62	1	34.31666667
+103.13.219.4	3	34.31666667
+203.143.186.45	4	34.3
+122.248.163.3	4	34.3
+14.139.220.98	1	34.3
+117.205.158.11	1	34.28333333
+164.100.222.44	4	34.26666667
+61.246.57.5	3	34.25
+171.159.64.10	2	34.25
+121.242.158.195	4	34.25
+123.108.60.147	3	34.25
+111.93.89.14	1	34.25
+193.194.132.74	3	34.25
+112.79.38.164	1	34.23333333
+115.248.37.69	3	34.23333333
+54.244.52.204	5	34.23333333
+125.19.44.195	3	34.21666667
+116.50.59.180	5	34.21666667
+119.226.211.70	3	34.21666667
+
+
+
+
+
